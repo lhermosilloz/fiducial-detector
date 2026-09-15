@@ -1,0 +1,24 @@
+build/
+*.o
+*.a
+compile_commands.json
+
+# Generated protobuf bindings. The .proto is the contract; these are build output
+# and must never be committed — a stale checked-in binding is a wire mismatch
+# that compiles cleanly.
+*.pb.cc
+*.pb.h
+*_pb2.py
+tools/fiducial_pb2.py
+
+__pycache__/
+*.pyc
+
+# Config written back by the service's self-heal, and local overrides.
+*.yaml.tmp
+*.yaml.reference
+config/local_*.yaml
+
+# Test artefacts from tools/make_test_video.py
+*.mp4
+*.truth.json
