@@ -41,12 +41,23 @@ SupplementaryGroups=video render
 # back), so /etc/fiducial-detector-service must be writable by it.
 ReadWritePaths=/etc/fiducial-detector-service
 
-# Hardening. PrivateDevices is deliberately not set: it would hide /dev/video*
-# and the Jetson's Argus device nodes.
+# Hardening, constrained by what the camera stacks actually need.
+#
+# PrivateDevices is not set: it would hide /dev/video* and the Jetson's camera
+# device nodes.
+#
+# PrivateTmp is NOT set either. On Jetson, nvarguscamerasrc talks to
+# nvargus-daemon over a Unix socket that lives in /tmp (/tmp/argus_socket). A
+# private /tmp namespace hides that socket and Argus fails with
+# "Failed to create CameraProvider", which looks like a permissions or camera
+# fault rather than a sandbox one.
+#
+# ProtectSystem is 'full', not 'strict'. Strict makes /run and /var read-only,
+# and connect() on a Unix socket requires write permission on the socket inode,
+# so strict blocks the daemon socket wherever it lives.
 NoNewPrivileges=yes
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=yes
-PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictRealtime=no

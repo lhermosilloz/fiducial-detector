@@ -208,12 +208,39 @@ fiducial-detector-service -c /etc/fiducial-detector-service/config.yaml
 
 That prints every problem and exits without touching a camera.
 
-**`nvarguscamerasrc` works in `gst-launch` but not in the service.** Almost always
-permissions: the unit runs as the unprivileged `fiducial` user. Confirm it is in `video`:
+**`Failed to create CameraProvider` in the journal.** The process cannot reach
+`nvargus-daemon`. Argus does not use `/dev/video*`; it talks to the daemon over a Unix
+socket in `/tmp`, so this is usually a sandbox or daemon problem rather than a device
+permission one.
+
+In order of likelihood:
+
+1. **systemd sandboxing.** `PrivateTmp=yes` gives the service a private `/tmp` and hides
+   `/tmp/argus_socket`; `ProtectSystem=strict` makes `/run` and `/var` read-only, and
+   `connect()` on a Unix socket needs write permission on the socket inode. The shipped
+   unit sets neither for this reason. If you have hardened it further, that is the first
+   thing to undo. Confirm by running as the same user without the sandbox:
+
+   ```bash
+   sudo systemctl stop fiducial-detector-service
+   sudo -u fiducial /usr/local/bin/fiducial-detector-service \
+        --config /etc/fiducial-detector-service/config.yaml --verbose
+   ```
+
+   Frames here but not under systemd means the sandbox, not permissions.
+
+2. **The daemon is not running.** `sudo systemctl restart nvargus-daemon`
+
+3. **Another Argus consumer holds the sensor.** Only one is permitted:
+   `ps aux | grep gst-launch`
+
+**`nvarguscamerasrc` works in `gst-launch` but not in the service.** If the error is not
+the one above, it is usually group membership: the unit runs as the unprivileged
+`fiducial` user.
 
 ```bash
-id fiducial
-sudo usermod -aG video fiducial && sudo systemctl restart fiducial-detector-service
+id fiducial      # expect video and render
+sudo usermod -aG video,render fiducial && sudo systemctl restart fiducial-detector-service
 ```
 
 **Pipeline keeps rebuilding.** Argus wedges; the per-stream watchdog is doing its job.
