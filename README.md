@@ -16,7 +16,9 @@ the GStreamer pipeline string in a YAML file.
 ## Status
 
 Implemented and verified against synthetic ground truth on x86. **Camera ingest is
-confirmed on the ARK Orin NX**: Argus binds the IMX477 and sustains 1920x1080 @ 60 fps, so `config/jetson_down.yaml` pins `sensor-mode=1`. The service itself has
+confirmed on the ARK Orin NX**: Argus binds the IMX219 (Raspberry Pi Camera v2) and
+streams at 1080p30, so `config/jetson_down.yaml` pins `sensor-mode=3`, the 1640x1232
+binned mode that keeps the full field of view. The service itself has
 not yet been run against that camera — see
 [deploy/jetson/JETSON_DEPLOYMENT.md](deploy/jetson/JETSON_DEPLOYMENT.md) for the bench
 procedure. Pi hardware is untouched.
@@ -27,7 +29,7 @@ procedure. Pi hardware is untouched.
 | Camera ingest | `nvarguscamerasrc` | `libcamerasrc` |
 | OpenCV | 4.8+ (aruco in core `objdetect`) | 4.6 (aruco in contrib) |
 | Detection | OpenCV CPU | OpenCV CPU |
-| Sensor modes | 3840x2160@30, 1920x1080@60 (confirmed) | not yet probed |
+| Sensor modes | IMX219: 5 modes, mode 3 (1640x1232 binned) used | not yet probed |
 | Status | ingest confirmed; service not yet bench-run | code complete, untested on board |
 
 Both OpenCV API generations are handled in [`include/aruco_compat.h`](include/aruco_compat.h),
@@ -142,8 +144,8 @@ bad deploy into a loud failure at boot instead of a restart loop.
 
 ```yaml
 camera:
-  fx: 1283.0        # CALIBRATE THESE. The shipped values are placeholders.
-  fy: 1283.0
+  fx: 1357.0        # Calibrate these; shipped values are geometry estimates.
+  fy: 1357.0
   cx: 640.0
   cy: 360.0
 tags:
@@ -152,8 +154,8 @@ tags:
 
 A 10% error in `fx`/`fy` or `default_size_m` is a 10% range error on every detection, and
 `range_m` is what Nexus ranks landing candidates on — it is load-bearing, not diagnostic.
-The IMX477 is C/CS mount and ships with **no lens**, so intrinsics are entirely
-lens-specific and must be re-measured on any lens swap.
+Intrinsics are specific to the camera, lens and sensor mode, and must be re-measured
+after any change to those.
 
 ```bash
 python3 tools/make_test_video.py --print-marker /tmp/tag0.png --size-m 0.30

@@ -1,6 +1,6 @@
 # Jetson deployment
 
-**Reference board:** ARK Jetson Orin NX, JetPack 6, Raspberry Pi HQ camera (IMX477).
+**Reference board:** ARK Jetson Orin NX, JetPack 6, Raspberry Pi Camera v2 (IMX219).
 
 This service runs on the Jetson CPU. It does not use CUDA or TensorRT; that is what
 allows the same binary to run on a Raspberry Pi. Adding a GPU dependency would remove
@@ -34,26 +34,68 @@ Three outcomes:
 
 | Result | What it means | What to do |
 |---|---|---|
-| Frames appear | Argus and the ISP are working | Use `config/jetson_down.yaml` unchanged. Done. |
-| Only raw Bayer over V4L2 (`RG10`/`BG10`) | The sensor is bound but there is no ISP in the path | You debayer yourself. See section 5 — it costs CPU and complexity. |
+| Frames appear | Argus and the ISP are working | Check the sensor mode list it prints, then see section 2. |
+| Only raw Bayer over V4L2 (`RG10`/`BG10`) | The sensor is bound but there is no ISP in the path | You debayer yourself; see section 6. |
 | Nothing enumerates | Device tree overlay and/or ribbon | Hardware. See below. |
 
-**If nothing enumerates.** The Pi HQ camera is a 15-pin FPC and many Jetson carriers are
-22-pin, so it needs an adapter — check ARK's docs for which CSI ports are actually wired
-on your carrier, because not all of the connectors present are. Then confirm the driver
-bound at all:
+**If nothing enumerates.** Pi camera modules use a 15-pin FPC and many Jetson carriers
+are 22-pin, so an adapter is needed. Check ARK's documentation for which CSI ports are
+actually wired on your carrier, since not all present connectors are. Then confirm the
+driver bound:
 
 ```bash
-sudo dmesg | grep -i imx477
+sudo dmesg | grep -i imx219
 ls /dev/video*
 sudo systemctl restart nvargus-daemon
 ```
 
-A missing device-tree overlay shows up as no `imx477` lines in dmesg at all.
+A missing device-tree overlay shows up as no `imx219` lines in dmesg at all.
+
+A probe failure on one address alongside a successful bind on another, such as
+
+```
+imx219 9-0010: board setup failed
+imx219 10-0010: subdev imx219 10-0010 bound
+```
+
+is normal with a single camera: it is the unpopulated CSI port failing its I2C probe.
 
 ---
 
-## 2. Build and install
+## 2. Choose the sensor mode
+
+This is the decision that determines field of view, and field of view is the binding
+constraint for precision landing. List the modes:
+
+```bash
+nvargus_nvraw --lps
+```
+
+The IMX219 array is 3280x2464, which is what separates a binned mode from a cropped one:
+
+| mode | resolution | fps | readout | horizontal FOV | visible at 1 m |
+|---|---|---|---|---|---|
+| 0 | 3280x2464 | 21 | full array | ~62° | 1.21 m |
+| 1 | 3280x1848 | 28 | full width, vertical crop | ~62° | 1.21 m |
+| 2 | 1920x1080 | 30 | centre crop | ~39° | 0.71 m |
+| 3 | 1640x1232 | 30 | **2x2 binned, full FOV** | ~62° | 1.21 m |
+| 4 | 1280x720 | 59 | crop | ~26° | 0.47 m |
+
+`config/jetson_down.yaml` uses **mode 3**. It is exactly half of 3280x2464 in each axis,
+so it is a binned readout that keeps the entire field of view at a manageable 2 MP.
+
+Modes 2 and 4 are crops. Mode 4 in particular looks attractive for its 59 fps and is the
+worst choice here: at 1 m altitude it sees 0.47 m across, so the pad leaves the frame
+during final approach. Trade frame rate away with `detect_fps` instead of buying it with
+field of view.
+
+Verify rather than trust the table: `tools/calibrate_camera.py` reports the measured
+horizontal FOV, and a cropped mode reports a markedly narrower one than a binned mode at
+the same output resolution.
+
+---
+
+## 3. Build and install
 
 On the Jetson:
 
@@ -75,24 +117,28 @@ proves the board's own OpenCV works.
 
 ---
 
-## 3. Calibrate before you believe any number
+## 4. Calibrate before relying on any number
 
-The intrinsics shipped in `config/jetson_down.yaml` are **placeholders** computed from a
-nominal 53° horizontal FOV. They are a bringup starting point, not a calibration.
+The intrinsics shipped in `config/jetson_down.yaml` are derived from the IMX219's sensor
+geometry: a 3.04 mm lens over 1.12 um pixels, binned 2x2 to 2.24 um, giving
+fx = fy = 3040 / 2.24 = 1357 px at mode 3. That yields 62.3 x 48.8 degrees, which matches
+the published module specification, so it is a sound starting point.
 
-The IMX477 is C/CS mount and **ships with no lens**, so intrinsics are entirely
-lens-specific and must be re-measured on any lens swap. A 10% error in `fx`/`fy` or in
-`tags.default_size_m` is a 10% range error on every detection — and `range_m` is what
-Nexus ranks landing candidates on, so it is load-bearing, not diagnostic.
+It is still not a calibration. It assumes a perfectly centred sensor and zero distortion,
+and the IMX219 lens has visible barrel distortion toward the edges. A 10% error in
+`fx`/`fy` or in `tags.default_size_m` produces a 10% range error on every detection, and
+range is what the consumer ranks landing candidates on.
 
-Two lens notes that matter more than resolution:
+```bash
+./tools/calibrate_camera.py --square-mm <measured> --gst \
+ "nvarguscamerasrc sensor-id=0 sensor-mode=3 !
+  video/x-raw(memory:NVMM),width=1640,height=1232,framerate=30/1 !
+  nvvidconv ! video/x-raw,format=BGRx ! videoconvert !
+  video/x-raw,format=BGR ! appsink drop=true max-buffers=2"
+```
 
-- **Take the wide option.** The 6 mm CS lens (~53° horizontal) over the 16 mm. At 1 m
-  altitude a narrow lens loses the pad out of frame, which is precisely when you need
-  it. FOV is the binding constraint for this application.
-- **Use a binned sensor mode, not a cropped one**, at 720p or below. Cropping a 12.3 MP
-  sensor narrows FOV drastically and silently — you get a perfectly sharp image of far
-  too little of the world.
+Recalibrate after any sensor-mode change: a different mode is a different crop or a
+different binning factor, so the focal length and principal point both move.
 
 Measure `tags.default_size_m` as the **outer edge of the black border**, not the white
 quiet zone. `tools/make_test_video.py --print-marker` prints a marker and tells you
@@ -100,7 +146,7 @@ exactly what to measure.
 
 ---
 
-## 4. Verify it works
+## 5. Verify it works
 
 ```bash
 # Is it publishing?
@@ -130,7 +176,7 @@ The service logs a stats line every 5 s:
 
 ---
 
-## 5. If you are stuck on raw Bayer
+## 6. If you are stuck on raw Bayer
 
 No ISP in the path means the CPU debayers. Replace the `gst:` line with something like:
 
@@ -152,7 +198,7 @@ lower quality and the detector is sensitive to it, so measure before optimising.
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 **Service refuses to start.** It validates its config first, on purpose:
 

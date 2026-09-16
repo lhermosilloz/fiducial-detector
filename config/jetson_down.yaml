@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # fiducial-detector-service: Jetson, single down-facing camera
 #
-# Reference board: ARK Jetson Orin NX, JetPack 6, IMX477 (Raspberry Pi HQ cam).
+# Reference board: ARK Jetson Orin NX, JetPack 6, IMX219 (Raspberry Pi Camera v2).
 #
 # This file and config/pi_down.yaml differ only in `gst:` and detect_fps.
 #
@@ -11,11 +11,10 @@
 
 streams:
   - camera_id: down          # Nexus demuxes on this and looks up extrinsics with it
-    # Detector working resolution: what nvvidconv scales to, not the sensor
-    # mode. Calibrate at this resolution.
-    frame_width: 1280
-    frame_height: 720
-    fps: 60
+    # Native mode 3 resolution; nothing is rescaled.
+    frame_width: 1640
+    frame_height: 1232
+    fps: 30
 
     # --- the only platform-varying line in this service ---
     #
@@ -29,69 +28,71 @@ streams:
     #
     # ---- Sensor mode is set explicitly ----
     #
-    # The IMX477 on this carrier exposes exactly two modes (confirmed on an ARK
-    # Orin NX; run tools/check_camera.sh to confirm on yours):
+    # The IMX219 exposes five modes (nvargus_nvraw --lps, or
+    # tools/check_camera.sh). The array is 3280x2464, which is what makes the
+    # difference between them:
     #
-    #     mode 0 : 3840x2160 @ 30 fps
-    #     mode 1 : 1920x1080 @ 60 fps
+    #     mode 0 : 3280x2464 @ 21   full array, full FOV
+    #     mode 1 : 3280x1848 @ 28   full width, cropped vertically
+    #     mode 2 : 1920x1080 @ 30   centre crop, ~39 deg horizontal
+    #     mode 3 : 1640x1232 @ 30   2x2 binned, full FOV, ~62 deg   <-- used here
+    #     mode 4 : 1280x720  @ 59   crop, ~26 deg horizontal
     #
-    # 1280x720 is not among them. Requesting it without naming a mode lets Argus
-    # choose, and that choice determines the field of view. An unpinned mode may
-    # also change across BSP updates. Request a real sensor mode, then let
-    # nvvidconv scale to the detector's working resolution.
+    # Mode 3 is exactly half of 3280x2464 in each axis, so it is a binned
+    # readout rather than a crop: it keeps the whole field of view. Modes 2 and
+    # 4 are crops and discard most of it.
     #
-    # Mode 1 is the default: 60 fps caps exposure at 16.6 ms, which reduces
-    # rolling-shutter skew on a moving vehicle. Rolling-shutter skew biases the
-    # pose systematically rather than adding noise.
+    # That matters more than resolution or frame rate here. At 1 m altitude
+    # mode 3 sees about 1.21 m across, mode 2 about 0.71 m, and mode 4 about
+    # 0.47 m. A narrow view loses the landing pad at exactly the altitude where
+    # it is needed.
     #
-    # Verify the field of view before relying on this. On the stock NVIDIA
-    # IMX477 device tree the 1080p mode is commonly a centre crop rather than a
-    # binned readout, which reduces FOV. Capture the same scene in both modes
-    # and compare:
+    # Mode 4 is tempting for its 59 fps, but it is the narrowest of all. Prefer
+    # a lower rate with the full field of view; use detect_fps to trade rate
+    # for CPU instead.
     #
-    #   for m in 0 1; do
-    #     gst-launch-1.0 nvarguscamerasrc sensor-id=0 sensor-mode=$m num-buffers=10 \
-    #       ! 'video/x-raw(memory:NVMM)' ! nvvidconv \
-    #       ! video/x-raw,format=BGRx ! videoconvert ! jpegenc \
-    #       ! multifilesink location=mode${m}_%d.jpg ; done
-    #
-    # If mode 0 shows meaningfully more of the scene, switch to it and set
-    # framerate=30/1. Recalibrate after any mode change: a different mode is a
-    # different crop, so cx/cy and the effective focal length all change.
+    # No scaling here: 1640x1232 is 4:3, and rescaling it to a 16:9 size would
+    # stretch the image non-uniformly. Set an explicit smaller size in the
+    # nvvidconv caps only if CPU requires it, and keep the aspect ratio (820x616
+    # is an exact half).
     gst: >-
-      nvarguscamerasrc sensor-id=0 sensor-mode=1 !
-      video/x-raw(memory:NVMM),width=1920,height=1080,framerate=60/1 !
-      nvvidconv ! video/x-raw,width=1280,height=720,format=NV12 !
+      nvarguscamerasrc sensor-id=0 sensor-mode=3 !
+      video/x-raw(memory:NVMM),width=1640,height=1232,framerate=30/1 !
+      nvvidconv ! video/x-raw,format=NV12 !
       appsink name=sink drop=true max-buffers=2 sync=false
 
     # Rebuild this pipeline if no buffer arrives for this long. Per stream.
     watchdog_timeout_sec: 3.0
 
-    # 0 detects on every delivered frame. Check `avg_detect` in the stats line:
-    # if it exceeds ~16 ms the detector is not keeping up at 60 fps, so cap this
-    # at 30 rather than letting it fall behind.
+    # 0 detects on every delivered frame. 1640x1232 is about 2 MP, so check
+    # `avg_detect` in the stats line: if it exceeds ~33 ms the detector is not
+    # keeping up at 30 fps. Cap this at 15 before reducing resolution, since
+    # resolution costs field of view indirectly by limiting how far a tag stays
+    # resolvable.
     detect_fps: 0.0
 
     camera:
-      # Placeholders: a 6 mm CS lens on IMX477 at 1280x720, computed from a
-      # nominal 53 deg horizontal FOV. These are a bringup starting point, not
-      # a calibration.
+      # Starting estimates for the IMX219 in mode 3, derived from the sensor
+      # geometry: 3.04 mm lens, 1.12 um pixels, 2x2 binned to 2.24 um.
+      #   fx = fy = 3040 um / 2.24 um = 1357 px
+      # This yields 62.3 x 48.8 deg, matching the published module spec, so it
+      # is a sound starting point. It is still not a calibration: it assumes a
+      # perfectly centred sensor and zero distortion, and the IMX219's lens has
+      # noticeable barrel distortion near the edges.
       #
-      # The IMX477 is C/CS mount and ships without a lens. Intrinsics are
-      # lens-specific and must be re-measured after any lens change. A 10%
-      # error here produces a 10% range error on every detection.
-      # Calibrate with tools/calibrate_camera.py before flight.
-      fx: 1283.0
-      fy: 1283.0
-      cx: 640.0
-      cy: 360.0
+      # Measure before flight:
+      #   tools/calibrate_camera.py --square-mm <measured> --gst "<this pipeline, BGR>"
+      fx: 1357.0
+      fy: 1357.0
+      cx: 820.0
+      cy: 616.0
       distortion_model: pinhole
       dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
 
       # The resolution these intrinsics were measured at. When this differs
       # from the negotiated frame size, the intrinsics are rescaled and logged.
-      calib_width: 1280
-      calib_height: 720
+      calib_width: 1640
+      calib_height: 1232
 
       # Full-frame rectification before detection. Off by default: detect on
       # the raw frame and let solvePnP use the distortion coefficients. Enable
