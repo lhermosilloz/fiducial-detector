@@ -1,0 +1,96 @@
+# ---------------------------------------------------------------------------
+# Two cameras, one process, one socket. Jetson example.
+#
+# A forward camera and a down camera seeing the same pad produce two estimates
+# of the same quantity, since every detection resolves to the same world point.
+# The consumer ranks them rather than switching between them, preferring the
+# smallest range_m, which also transitions forward -> down during a descent
+# without explicit mode logic.
+#
+# Requirements for that to work:
+#   * camera_id is unique and stable. The consumer demultiplexes on it and uses
+#     it to look up that camera's mount extrinsics.
+#   * intrinsics are per camera; these are different lenses.
+#   * each stream heartbeats independently, so one dead camera does not mask a
+#     live one.
+#   * each stream has its own watchdog, so a wedged pipeline rebuilds without
+#     affecting the other stream.
+#
+# Mount extrinsics are intentionally not configured here. They are per-vehicle
+# and belong in the consumer's configuration, so one service binary serves every
+# airframe and the optical->body->NED transform exists in one place.
+# ---------------------------------------------------------------------------
+
+streams:
+  - camera_id: down
+    gst: >-
+      nvarguscamerasrc sensor-id=0 !
+      video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1 !
+      nvvidconv ! video/x-raw,format=NV12 !
+      appsink name=sink drop=true max-buffers=2 sync=false
+    frame_width: 1280
+    frame_height: 720
+    fps: 30
+    watchdog_timeout_sec: 3.0
+    camera:
+      fx: 1283.0
+      fy: 1283.0
+      cx: 640.0
+      cy: 360.0
+      distortion_model: pinhole
+      dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+      calib_width: 1280
+      calib_height: 720
+    detector:
+      family: apriltag_36h11
+      max_reproj_error_px: 6.0
+    tags:
+      default_size_m: 0.30
+      sizes:
+        - {id: 0, size_m: 0.50}
+        - {id: 1, size_m: 0.12}
+      accept_ids: [0, 1]
+
+  - camera_id: forward
+    gst: >-
+      nvarguscamerasrc sensor-id=1 !
+      video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1 !
+      nvvidconv ! video/x-raw,format=NV12 !
+      appsink name=sink drop=true max-buffers=2 sync=false
+    frame_width: 1280
+    frame_height: 720
+    fps: 30
+    watchdog_timeout_sec: 3.0
+    camera:
+      # A different lens. Copying the down camera's intrinsics because the
+      # sensors match produces a wrong range that looks like a working system.
+      fx: 1283.0
+      fy: 1283.0
+      cx: 640.0
+      cy: 360.0
+      distortion_model: pinhole
+      dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+      calib_width: 1280
+      calib_height: 720
+    detector:
+      # Each stream owns its own detector and dictionary, so per-stream
+      # families are safe.
+      family: apriltag_36h11
+      max_reproj_error_px: 6.0
+    tags:
+      default_size_m: 0.50
+      sizes:
+        - {id: 0, size_m: 0.50}
+      # The forward camera needs only the large approach tag; the small one is
+      # unreadable at the ranges this camera is useful at.
+      accept_ids: [0]
+
+udp:
+  enabled: true
+  dest_ip: 127.0.0.1
+  dest_port: 5602
+  heartbeat_hz: 10.0
+
+logging:
+  stats_interval_sec: 5
+  verbose: false

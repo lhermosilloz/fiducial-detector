@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------------------
+# fiducial-detector-service: Raspberry Pi, single down-facing camera
+#
+# Reference board: Pi 4 / Pi 5, Raspberry Pi OS Bookworm, IMX477 (HQ camera).
+#
+# This file and config/jetson_down.yaml differ only in `gst:` and detect_fps,
+# the latter being a Pi 4 performance choice rather than a platform difference:
+#
+#   diff config/jetson_down.yaml config/pi_down.yaml
+#
+# Confirm the camera enumerates before use:
+#   tools/check_camera.sh
+# ---------------------------------------------------------------------------
+
+streams:
+  - camera_id: down          # Nexus demuxes on this and looks up extrinsics with it
+    frame_width: 1280
+    frame_height: 720
+    fps: 30
+
+    # --- the only platform-varying line in this service ---
+    #
+    # Bookworm uses libcamera, so the element is libcamerasrc. rpicamsrc is the
+    # legacy Buster/Broadcom element and is not present on Bookworm.
+    #
+    # libcamerasrc negotiates NV12 directly and plane 0 is the grayscale image,
+    # so no videoconvert is needed. This matters more here than on the Jetson: a
+    # per-frame colour conversion at 720p is significant on a Pi 4 CPU that is
+    # also running the detector.
+    gst: >-
+      libcamerasrc !
+      video/x-raw,width=1280,height=720,framerate=30/1,format=NV12 !
+      appsink name=sink drop=true max-buffers=2 sync=false
+
+    watchdog_timeout_sec: 3.0
+
+    # ArUco/AprilTag at 720p does not hold 30 fps on a Pi 4. Capping the
+    # detector at 15 Hz skips frames on a schedule rather than letting the
+    # detector fall progressively behind. Raise this on a Pi 5, or reduce the
+    # stream to 640x480 and raise it here. Measure the `det=` field in the stats
+    # line before choosing.
+    detect_fps: 15.0
+
+    camera:
+      # Placeholders; see config/jetson_down.yaml. Calibrate per physical
+      # camera and lens: two IMX477s with nominally identical 6 mm lenses do
+      # not share intrinsics closely enough for a 10 cm landing.
+      # Use tools/calibrate_camera.py.
+      fx: 1283.0
+      fy: 1283.0
+      cx: 640.0
+      cy: 360.0
+      distortion_model: pinhole
+      dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+      calib_width: 1280
+      calib_height: 720
+      undistort: false
+
+    detector:
+      family: apriltag_36h11
+      max_reproj_error_px: 6.0
+      min_range_m: 0.05
+      max_range_m: 100.0
+      params:
+        corner_refine: subpix
+        corner_refine_win_size: 5
+        error_correction_rate: 0.6
+        min_marker_perimeter_rate: 0.03
+
+    tags:
+      default_size_m: 0.30
+      sizes:
+        - {id: 0, size_m: 0.50}
+        - {id: 1, size_m: 0.12}
+      accept_ids: [0, 1]
+
+udp:
+  enabled: true
+  # To run the detector on the Pi and the consumer on another machine, point
+  # dest_ip at that machine. Note that CLOCK_MONOTONIC is per-machine and
+  # per-boot, so timestamps from the two are not directly comparable. Every
+  # frame carries clock_domain so the consumer can detect the mismatch.
+  dest_ip: 127.0.0.1
+  dest_port: 5602
+  heartbeat_hz: 10.0
+
+logging:
+  stats_interval_sec: 5
+  verbose: false

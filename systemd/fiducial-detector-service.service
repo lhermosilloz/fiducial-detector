@@ -1,0 +1,70 @@
+# ---------------------------------------------------------------------------
+# fiducial-detector-service
+#
+# One unit for both platforms. Jetson and Pi differ only in the config file's
+# `gst:` line, so they differ only in which config is installed at
+# /etc/fiducial-detector-service/config.yaml, not in this unit or the binary.
+#
+# Installed by deploy/jetson/install_service.sh or deploy/pi/install_service.sh.
+# ---------------------------------------------------------------------------
+
+[Unit]
+Description=Fiducial Detector Service (AprilTag/ArUco pose over UDP)
+Documentation=file:/usr/share/doc/fiducial-detector-service/README.md
+After=network.target
+# The camera stack must be up first. Both are conditional: systemd ignores an
+# After= on a unit that does not exist, so this one line covers both platforms.
+After=nvargus-daemon.service
+Wants=nvargus-daemon.service
+# Start before the consumer so heartbeats are already flowing when it binds,
+# and its per-camera liveness starts in the correct state.
+Before=nexus.service
+
+[Service]
+Type=simple
+
+# Validate the config before claiming to have started. Exits nonzero on a bad
+# config, so a broken deploy fails loudly at boot rather than restart-looping
+# with the real reason buried in the journal.
+ExecStartPre=/usr/local/bin/fiducial-detector-service -c /etc/fiducial-detector-service/config.yaml
+
+ExecStart=/usr/local/bin/fiducial-detector-service \
+    --config /etc/fiducial-detector-service/config.yaml
+
+# Camera access needs the video group on both platforms. If the libcamera stack
+# later requires additional groups, add them here rather than running as root.
+User=fiducial
+Group=fiducial
+SupplementaryGroups=video render
+
+# The service self-heals its config (fills absent keys with defaults and writes
+# back), so /etc/fiducial-detector-service must be writable by it.
+ReadWritePaths=/etc/fiducial-detector-service
+
+# Hardening. PrivateDevices is deliberately not set: it would hide /dev/video*
+# and the Jetson's Argus device nodes.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# A wedged GStreamer pipeline is handled in-process by the per-stream watchdog,
+# which rebuilds one pipeline without disturbing the others. Restart= here is
+# the backstop for the process itself exiting.
+Restart=on-failure
+RestartSec=5
+
+# Vision work competes with everything else on the board, and a late pose is a
+# stale pose. Modest priority increase, not realtime scheduling.
+Nice=-5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fiducial-detector
+
+[Install]
+WantedBy=multi-user.target

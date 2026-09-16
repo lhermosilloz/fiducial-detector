@@ -1,0 +1,147 @@
+# ---------------------------------------------------------------------------
+# fiducial-detector-service: Jetson, single down-facing camera
+#
+# Reference board: ARK Jetson Orin NX, JetPack 6, IMX477 (Raspberry Pi HQ cam).
+#
+# This file and config/pi_down.yaml differ only in `gst:` and detect_fps.
+#
+# Confirm the camera enumerates before use:
+#   tools/check_camera.sh
+# ---------------------------------------------------------------------------
+
+streams:
+  - camera_id: down          # Nexus demuxes on this and looks up extrinsics with it
+    # Detector working resolution: what nvvidconv scales to, not the sensor
+    # mode. Calibrate at this resolution.
+    frame_width: 1280
+    frame_height: 720
+    fps: 60
+
+    # --- the only platform-varying line in this service ---
+    #
+    # nvarguscamerasrc runs the Jetson ISP over Argus, so the CSI sensor's raw
+    # Bayer is debayered in hardware and we get NV12 for free. nvvidconv moves
+    # it out of NVMM into system memory AND rescales; plane 0 of that NV12 is
+    # the grayscale image the detector wants, at zero copy.
+    #
+    # If nvarguscamerasrc does not produce frames, the sensor is not bound to
+    # Argus (device tree / ribbon). See deploy/jetson/JETSON_DEPLOYMENT.md.
+    #
+    # ---- Sensor mode is set explicitly ----
+    #
+    # The IMX477 on this carrier exposes exactly two modes (confirmed on an ARK
+    # Orin NX; run tools/check_camera.sh to confirm on yours):
+    #
+    #     mode 0 : 3840x2160 @ 30 fps
+    #     mode 1 : 1920x1080 @ 60 fps
+    #
+    # 1280x720 is not among them. Requesting it without naming a mode lets Argus
+    # choose, and that choice determines the field of view. An unpinned mode may
+    # also change across BSP updates. Request a real sensor mode, then let
+    # nvvidconv scale to the detector's working resolution.
+    #
+    # Mode 1 is the default: 60 fps caps exposure at 16.6 ms, which reduces
+    # rolling-shutter skew on a moving vehicle. Rolling-shutter skew biases the
+    # pose systematically rather than adding noise.
+    #
+    # Verify the field of view before relying on this. On the stock NVIDIA
+    # IMX477 device tree the 1080p mode is commonly a centre crop rather than a
+    # binned readout, which reduces FOV. Capture the same scene in both modes
+    # and compare:
+    #
+    #   for m in 0 1; do
+    #     gst-launch-1.0 nvarguscamerasrc sensor-id=0 sensor-mode=$m num-buffers=10 \
+    #       ! 'video/x-raw(memory:NVMM)' ! nvvidconv \
+    #       ! video/x-raw,format=BGRx ! videoconvert ! jpegenc \
+    #       ! multifilesink location=mode${m}_%d.jpg ; done
+    #
+    # If mode 0 shows meaningfully more of the scene, switch to it and set
+    # framerate=30/1. Recalibrate after any mode change: a different mode is a
+    # different crop, so cx/cy and the effective focal length all change.
+    gst: >-
+      nvarguscamerasrc sensor-id=0 sensor-mode=1 !
+      video/x-raw(memory:NVMM),width=1920,height=1080,framerate=60/1 !
+      nvvidconv ! video/x-raw,width=1280,height=720,format=NV12 !
+      appsink name=sink drop=true max-buffers=2 sync=false
+
+    # Rebuild this pipeline if no buffer arrives for this long. Per stream.
+    watchdog_timeout_sec: 3.0
+
+    # 0 detects on every delivered frame. Check `avg_detect` in the stats line:
+    # if it exceeds ~16 ms the detector is not keeping up at 60 fps, so cap this
+    # at 30 rather than letting it fall behind.
+    detect_fps: 0.0
+
+    camera:
+      # Placeholders: a 6 mm CS lens on IMX477 at 1280x720, computed from a
+      # nominal 53 deg horizontal FOV. These are a bringup starting point, not
+      # a calibration.
+      #
+      # The IMX477 is C/CS mount and ships without a lens. Intrinsics are
+      # lens-specific and must be re-measured after any lens change. A 10%
+      # error here produces a 10% range error on every detection.
+      # Calibrate with tools/calibrate_camera.py before flight.
+      fx: 1283.0
+      fy: 1283.0
+      cx: 640.0
+      cy: 360.0
+      distortion_model: pinhole
+      dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+      # The resolution these intrinsics were measured at. When this differs
+      # from the negotiated frame size, the intrinsics are rescaled and logged.
+      calib_width: 1280
+      calib_height: 720
+
+      # Full-frame rectification before detection. Off by default: detect on
+      # the raw frame and let solvePnP use the distortion coefficients. Enable
+      # only if a wide lens distorts tag edges enough to hurt detection rate;
+      # it costs a remap per frame.
+      undistort: false
+
+    detector:
+      # apriltag_36h11 has better false-positive rejection than 4x4 ArUco.
+      # Use aruco_4x4_50 when testing against SITL assets, which use
+      # DICT_4X4_50.
+      family: apriltag_36h11
+
+      # Quality gate. Also published, since the consumer ranks candidates on
+      # this value.
+      max_reproj_error_px: 6.0
+      min_range_m: 0.05
+      max_range_m: 100.0
+
+      params:
+        corner_refine: subpix
+        corner_refine_win_size: 5
+        # Lower is a stricter decode and fewer false positives. Closest
+        # OpenCV equivalent to AprilTag's decision margin.
+        error_correction_rate: 0.6
+        min_marker_perimeter_rate: 0.03
+
+    tags:
+      # Outer edge of the black border, not the white quiet zone.
+      default_size_m: 0.30
+
+      # Nested tag sets: a large tag for approach plus a small co-located tag
+      # for close range, once the large one leaves the field of view.
+      sizes:
+        - {id: 0, size_m: 0.50}
+        - {id: 1, size_m: 0.12}
+
+      # Empty accepts every id the dictionary decodes. Populating this is the
+      # cheapest available false-positive filter.
+      accept_ids: [0, 1]
+
+udp:
+  enabled: true
+  dest_ip: 127.0.0.1
+  # 5602. 5601 belongs to jetson-vision-service.
+  dest_port: 5602
+  # Per-camera liveness. Without heartbeats, a crashed detector and an empty
+  # field of view are indistinguishable to the consumer.
+  heartbeat_hz: 10.0
+
+logging:
+  stats_interval_sec: 5
+  verbose: false

@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# Replay a recorded or synthetic clip. No camera, no board, no SITL.
+#
+# The detector takes no telemetry and has no notion of a world frame, so
+# replaying a file produces identical output every run. This is the regression
+# test for the detector and the pose solve, and it runs without hardware.
+#
+# Generate a clip with known ground truth:
+#   python3 tools/make_test_video.py --out /tmp/tag.mp4
+#
+# Run:
+#   ./build/fiducial-detector-service --config config/replay_test.yaml
+#
+# Watch:
+#   ./tools/recv_fiducial.py --raw
+#
+# The intrinsics and tag size below match make_test_video.py's defaults.
+# Changing one without the other produces the same error a miscalibrated camera
+# would.
+# ---------------------------------------------------------------------------
+
+streams:
+  - camera_id: replay
+    # No drop=true here, unlike the camera configs: this is a finite source and
+    # every frame should be processed, so the appsink blocks rather than
+    # discarding. Dropping would make the replay non-deterministic, since
+    # filesrc pushes as fast as it can decode.
+    gst: >-
+      filesrc location=/tmp/tag.mp4 !
+      decodebin ! videoconvert ! video/x-raw,format=GRAY8 !
+      appsink name=sink max-buffers=4 sync=false
+    frame_width: 1280
+    frame_height: 720
+    fps: 30
+
+    # A file source reaches EOS when it finishes. For a camera that indicates a
+    # wedged pipeline to rebuild; for a file it means completion. Set here so
+    # replay terminates instead of looping. Remove for soak testing.
+    exit_on_eos: true
+
+    watchdog_timeout_sec: 3.0
+    detect_fps: 0.0
+
+    camera:
+      fx: 1283.0
+      fy: 1283.0
+      cx: 640.0
+      cy: 360.0
+      distortion_model: pinhole
+      dist_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+      calib_width: 1280
+      calib_height: 720
+      undistort: false
+
+    detector:
+      family: apriltag_36h11
+      max_reproj_error_px: 6.0
+      min_range_m: 0.05
+      max_range_m: 100.0
+      params:
+        corner_refine: subpix
+
+    tags:
+      default_size_m: 0.30
+
+udp:
+  enabled: true
+  dest_ip: 127.0.0.1
+  dest_port: 5602
+  heartbeat_hz: 10.0
+
+logging:
+  stats_interval_sec: 2
+  verbose: false
