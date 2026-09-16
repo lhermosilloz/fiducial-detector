@@ -22,3 +22,6 @@ config/local_*.yaml
 # Test artefacts from tools/make_test_video.py
 *.mp4
 *.truth.json
+
+# Internal design notes; not published with the service.
+HANDOFF.md
