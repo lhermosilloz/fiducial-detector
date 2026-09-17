@@ -115,6 +115,7 @@ void StreamWorker::maybeHeartbeat(uint64_t now_us)
     if (!udp_ || heartbeat_period_us_ == 0) return;
     if (now_us - last_publish_us_ < heartbeat_period_us_) return;
 
+    ++frame_id_;
     udp_->sendHeartbeat(now_us, frame_id_, last_w_, last_h_);
     last_publish_us_ = now_us;
     ++heartbeats_;
@@ -225,10 +226,10 @@ void StreamWorker::run()
 
                 ++frames_detected_;
                 detect_ms_sum_ += detect_ms;
-                ++frame_id_;
 
                 if (!detections_.empty())
                 {
+                    ++frame_id_;
                     if (udp_)
                         udp_->send(frame.capture_mono_us, frame_id_, last_w_, last_h_,
                                    detections_, detect_ms);

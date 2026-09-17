@@ -19,10 +19,15 @@ namespace
 
 std::once_flag g_gst_init_once;
 
-/// A capture stamp may legitimately sit a little ahead of "now": the clocks are
-/// sampled at slightly different moments. Beyond this, the source is not running
-/// in real time.
-constexpr uint64_t kFutureStampSlackUs = 100000;  // 100 ms
+/// A capture stamp may sit marginally ahead of "now" because the two clocks are
+/// sampled at slightly different moments; that error is microseconds. Beyond
+/// this the source is not running in real time, and the stamp is a media
+/// timestamp rather than a capture time.
+///
+/// Kept well under one frame period: a stamp a whole frame in the future cannot
+/// be a capture time. Too generous a slack lets a fast file replay publish
+/// capture stamps later than their own publish stamps.
+constexpr uint64_t kFutureStampSlackUs = 10000;  // 10 ms
 
 /// Find the appsink. Prefers name=sink (what the shipped configs use); falls
 /// back to scanning the bin so a hand-written pipeline that forgot to name it

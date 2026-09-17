@@ -66,6 +66,10 @@ private:
 
     std::vector<Detection> detections_;
 
+    /// Sequence number of PUBLISHED datagrams, not of processed frames. A
+    /// consumer uses it to detect loss, so it must advance once per datagram
+    /// and never skip: a frame the detector processed but did not publish
+    /// (nothing in view) must not look like a dropped packet.
     int32_t  frame_id_ = 0;
     uint32_t last_w_   = 0;
     uint32_t last_h_   = 0;
