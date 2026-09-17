@@ -60,6 +60,137 @@ Platform guides: **[deploy/jetson/JETSON_DEPLOYMENT.md](deploy/jetson/JETSON_DEP
 
 ---
 
+## Updating an installed service
+
+Rebuilding the source tree does **not** change what is running. `install_service.sh`
+copies the binary to `/usr/local/bin/`, so a rebuild alone leaves the old one in place:
+
+```bash
+git pull
+rm -rf build && ./deploy/build.sh
+sudo ./deploy/jetson/install_service.sh          # or deploy/pi/…
+sudo systemctl restart fiducial-detector-service
+```
+
+The installer overwrites the binary, the unit, the tools and the docs, but **never the
+config** — `/etc/fiducial-detector-service/config.yaml` holds measured intrinsics and is
+left alone, with the repo's version copied alongside as `*.reference` for diffing.
+
+Confirm the running binary is the one you just built:
+
+```bash
+md5sum build/fiducial-detector-service /usr/local/bin/fiducial-detector-service
+```
+
+---
+
+## Clean reset and staged verification
+
+For reproducing a deployment from a known state, rather than on top of whatever a
+previous attempt left behind.
+
+### 1. Tear down
+
+```bash
+sudo ./deploy/uninstall_service.sh --purge
+```
+
+Removes the unit, binary, tools and docs. `--purge` also removes the config directory and
+the `fiducial` service user; without it both are preserved, since the config holds
+calibration you cannot regenerate. The script also kills any stray manual run and
+restarts `nvargus-daemon`, both of which otherwise leave the camera claimed and block the
+next install.
+
+```bash
+ps aux | grep -E 'fiducial-detector|gst-launch' | grep -v grep     # expect nothing
+```
+
+### 2. Prove the camera independently
+
+Before rebuilding, confirm the hardware works with the service out of the way, so you are
+not debugging two things at once. On Jetson:
+
+```bash
+gst-launch-1.0 nvarguscamerasrc sensor-id=0 sensor-mode=3 num-buffers=60 \
+  ! 'video/x-raw(memory:NVMM),width=1640,height=1232,framerate=30/1' \
+  ! nvvidconv ! 'video/x-raw,format=NV12' ! fakesink -v
+```
+
+Look for `Camera mode = 3` and `Done Success`. `CANCELLED / Argus Correctable Error
+Status` after `Cleaning up` is normal teardown noise from `num-buffers`.
+
+### 3. Build from a clean tree
+
+```bash
+rm -rf build
+git submodule update --init --recursive
+./deploy/build.sh
+```
+
+A fresh clone into a new directory is the stronger check, since it also verifies the
+repository is self-sufficient:
+
+```bash
+git clone --recursive <repo-url> fiducial-detector-clean && cd fiducial-detector-clean
+./deploy/build.sh
+```
+
+Expect these three lines:
+
+```
+-- fiducial.proto: protos/ submodule (canonical, nexus-protos)
+-- OpenCV >= 4.7: using cv::aruco::ArucoDetector
+[build] ok -> .../build/fiducial-detector-service
+```
+
+### 4. Verify in stages
+
+Each step adds exactly one variable, so the first failure names its own cause. Press
+Ctrl-C between steps: a process left running holds the camera and makes the next step
+fail for the wrong reason.
+
+```bash
+# a. config only — no camera involved
+./build/fiducial-detector-service -c config/jetson_down.yaml
+
+# b. as yourself — adds the binary and the camera
+./build/fiducial-detector-service --config config/jetson_down.yaml --verbose
+
+# c. as the service user, no sandbox — adds the unprivileged user
+sudo ./deploy/jetson/install_service.sh
+sudo -u fiducial /usr/local/bin/fiducial-detector-service \
+     --config /etc/fiducial-detector-service/config.yaml --verbose
+
+# d. under systemd — adds the sandbox
+sudo systemctl start fiducial-detector-service
+journalctl -u fiducial-detector-service -f
+```
+
+| first failure at | cause |
+|---|---|
+| a | config: intrinsics, pipeline string, tag family |
+| b | camera, sensor mode, device tree, or another Argus client |
+| c | the `fiducial` user's group membership or device-node access |
+| d | systemd sandboxing — see the Jetson guide's troubleshooting section |
+
+Step (b) should print `first frame <width>x<height>`; (d) should reach the same point in
+the journal.
+
+### 5. Confirm output
+
+```bash
+./tools/recv_fiducial.py --check --timeout 15
+```
+
+Heartbeats with nothing in view, `DET` lines with a tag in frame, and `wire contract: OK`.
+`frame_id gaps` should be 0 on loopback; anything else means real packet loss.
+
+Finally, put the tag at a **measured** distance and compare against the reported range.
+That single check validates the intrinsics, the tag size and the pose solve together, and
+it is the one step that cannot be skipped before trusting any number.
+
+---
+
 ## No camera? Everything still works.
 
 The detector takes no telemetry and has no notion of a world frame, so it is a pure
@@ -211,19 +342,26 @@ Three properties worth knowing before you touch it:
 and one lost fragment drops the whole frame — breaking only on the cross-SoC path the
 transport was chosen for. The publisher warns if a datagram crosses that line.
 
-### The proto has two copies right now
+### Where the contract lives
 
-`protos/fiducial.proto` in this repo is a **bootstrap copy** so the service builds today.
-It must be upstreamed into `nexus-protos` and consumed from there, because two copies of
-a wire contract synchronised by hand is precisely the hazard that ruled out MPA's packed
-struct — it fails slowly and quietly, at the field-number level, in flight.
+`protos/` is the `nexus-protos` submodule, so there is exactly one copy of this contract
+and both sides pin a commit. Clone with `--recursive`, or run
+`git submodule update --init --recursive` after a plain clone; the build fails with an
+explicit message if the submodule is missing.
+
+Changing the contract is one pull request in `nexus-protos`, after which each consumer
+bumps its pin:
+
+```bash
+git -C protos fetch origin && git -C protos checkout main && git -C protos pull
+git add protos && git commit -m "protos: bump to <sha>"
+```
+
+To build against an unmerged contract change without moving the pin:
 
 ```bash
 ./deploy/build.sh --nexus-protos /path/to/nexus-protos
 ```
-
-builds against the canonical file. Once it has landed upstream, take `nexus-protos` as a
-submodule at `protos/` and delete the bootstrap copy.
 
 ---
 
@@ -254,7 +392,7 @@ a `// TODO check hamming and validity` and never implemented.
 
 ```
 CMakeLists.txt              one build, both platforms, no CUDA
-protos/fiducial.proto       wire contract (bootstrap copy — belongs in nexus-protos)
+protos/                     nexus-protos submodule: the wire contract
 include/ src/
   aruco_compat.h            the ONLY conditional compilation: OpenCV <4.7 vs >=4.7
   app_config.*              YAML streams: list, self-healing defaults, validation
@@ -265,7 +403,8 @@ include/ src/
   clock_domain.*            boot id and monotonic/realtime stamps
 config/                     jetson_down, pi_down, jetson_dual, replay_test
 systemd/                    one unit, both platforms
-deploy/                     shared scripts + jetson/ and pi/ wrappers and guides
+deploy/                     shared build/install/uninstall scripts, plus
+                            jetson/ and pi/ wrappers and platform guides
 tools/
   fake_publisher.py         synthetic frames -> drives Nexus with no hardware
   recv_fiducial.py          decode + verify wire invariants
