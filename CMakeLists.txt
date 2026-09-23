@@ -28,7 +28,17 @@ endif()
 # ---- Dependencies ---------------------------------------------------------
 
 find_package(Protobuf REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d objdetect)
+# ArUco moved between modules in OpenCV 4.7: before it, it is the separate
+# contrib module opencv_aruco; from 4.7 it is part of core objdetect. The
+# version is only known after a first find_package, so discover it and then
+# request the correct module set. Omitting opencv_aruco on an older OpenCV
+# still compiles and fails at link with undefined cv::aruco symbols.
+find_package(OpenCV REQUIRED)
+if(OpenCV_VERSION VERSION_LESS 4.7.0)
+    find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d aruco)
+else()
+    find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d objdetect)
+endif()
 find_package(yaml-cpp REQUIRED)
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
@@ -46,16 +56,9 @@ message(STATUS "GStreamer ${GST_gstreamer-1.0_VERSION}")
 # objdetect (cv::aruco::ArucoDetector) in 4.7.0. Raspberry Pi OS Bookworm ships
 # 4.6.0; JetPack 6 ships 4.8+. Both are supported via include/aruco_compat.h.
 if(OpenCV_VERSION VERSION_LESS 4.7.0)
-    message(STATUS "OpenCV < 4.7: using legacy cv::aruco contrib API")
-    if(NOT EXISTS "${OpenCV_INCLUDE_DIRS}/opencv2/aruco.hpp"
-       AND NOT EXISTS "/usr/include/opencv4/opencv2/aruco.hpp")
-        message(WARNING
-            "OpenCV ${OpenCV_VERSION} without opencv2/aruco.hpp. On Debian/Ubuntu "
-            "install libopencv-dev (which bundles contrib); a hand-built OpenCV "
-            "needs -DOPENCV_EXTRA_MODULES_PATH pointing at opencv_contrib.")
-    endif()
+    message(STATUS "OpenCV < 4.7: using legacy cv::aruco contrib API (opencv_aruco)")
 else()
-    message(STATUS "OpenCV >= 4.7: using cv::aruco::ArucoDetector")
+    message(STATUS "OpenCV >= 4.7: using cv::aruco::ArucoDetector (objdetect)")
 endif()
 
 # ---- Protobuf codegen -----------------------------------------------------
