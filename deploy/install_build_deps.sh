@@ -26,7 +26,7 @@ elif grep -qi raspberry /proc/device-tree/model 2>/dev/null; then
 fi
 echo "[deps] platform: ${PLATFORM}"
 
-apt-get update
+# apt-get update
 
 # ---- common: the whole dependency surface --------------------------------
 #
