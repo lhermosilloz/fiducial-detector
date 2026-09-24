@@ -81,11 +81,37 @@ sampling early and calibrates on what has been collected.
 The board
 ---------
 Default is a 9x6 INNER-CORNER chessboard (a 10x7 grid of squares) with 25 mm
-squares. Print it on rigid, flat stock — a curled sheet calibrates the curl into
-your intrinsics, and taped-to-a-wall paper is the single most common reason a
-calibration comes out plausible but wrong. Measure a printed square with calipers
-and pass the real number to --square-mm; printer scaling is routinely off by a
-few percent, and that percentage lands directly in your range.
+squares, but 25 mm is small for this workflow and you should print bigger.
+
+FLATNESS is the thing that decides whether a calibration is any good. The solver
+is told the corners are coplanar, so every millimetre they are not goes straight
+into the fit, and no number of extra views averages it out. Measured on a 200 mm
+board:
+
+    bow 1 mm (0.5% of width)  ->  ~0.19 px median error
+    bow 2 mm (1.0%)           ->  ~0.39 px
+    bow 5 mm (2.5%)           ->  ~0.96 px, and fx wrong by ~4%
+
+Only the RATIO of bow to board width matters, so keep it under about 0.5% of the
+width. Paper taped to a wall does not manage that; paper spray-mounted to glass,
+MDF or aluminium composite does. Note this is invisible in the preview — a bent
+board looks perfectly sharp.
+
+Defocus and straight-line motion blur are, perhaps surprisingly, NOT major
+causes: both are symmetric and leave a chessboard saddle point where it was.
+Rolling-shutter shear from a board moving during exposure is asymmetric and does
+bias corners, so hold still.
+
+SIZE matters because the fill thresholds fix a working distance: a given fraction
+of a given box can only be satisfied from one range. 25 mm squares put an IMX219
+at about 0.30 m, which is cramped and leaves little room to tilt; 50-65 mm puts
+it at a comfortable 0.5-0.9 m. ModalAI's default is 65.5 mm. The tool computes
+this at startup and says so.
+
+Measure a printed square with calipers and pass the real number to --square-mm.
+Printer scaling is routinely off by a few percent. This does NOT affect fx, which
+is set by perspective rather than by absolute scale, but it does scale every
+distance the service derives.
 """
 
 import argparse
@@ -116,6 +142,10 @@ FISHEYE_ERROR_CUTOFF = 0.60
 
 # Corner refinement window, in pixels, on the raw image.
 SUBPIX_WINDOW = 5
+
+# How long to let the camera shut down before giving up on it. See the release
+# call in main() for why this exists at all.
+RELEASE_TIMEOUT = 5.0
 
 # Nudges every tile threshold up or down. 0 suits a normal visible-light sensor.
 # Raise it for a washed-out or low-contrast image, where the isodata cutoff lands
@@ -154,11 +184,11 @@ SENSORS = {
     "imx219": {
         "desc": "Raspberry Pi Camera v2 — 3280x2464, 1.12 um px, fixed 3.04 mm lens",
         "modes": {
-            0: dict(w=3280, h=2464, fps=21, fx=2714.0, kind="full array"),
-            1: dict(w=3280, h=1848, fps=28, fx=2714.0, kind="vertical crop"),
-            2: dict(w=1920, h=1080, fps=30, fx=2714.0, kind="centre crop"),
-            3: dict(w=1640, h=1232, fps=30, fx=1357.0, kind="2x2 binned, full FOV"),
-            4: dict(w=1280, h=720, fps=59, fx=2714.0, kind="crop"),
+            0: dict(w=3280, h=2464, fps=21, fx=2714.0, px_um=1.12, kind="full array"),
+            1: dict(w=3280, h=1848, fps=28, fx=2714.0, px_um=1.12, kind="vertical crop"),
+            2: dict(w=1920, h=1080, fps=30, fx=2714.0, px_um=1.12, kind="centre crop"),
+            3: dict(w=1640, h=1232, fps=30, fx=1357.0, px_um=2.24, kind="2x2 binned, full FOV"),
+            4: dict(w=1280, h=720, fps=59, fx=2714.0, px_um=1.12, kind="crop"),
         },
         "default_mode": 3,
     },
@@ -167,10 +197,10 @@ SENSORS = {
     "imx477": {
         "desc": "Raspberry Pi HQ camera — 4056x3040, 1.55 um px, C/CS-mount lens",
         "modes": {
-            0: dict(w=4056, h=3040, fps=10, fx=None, kind="full array"),
-            1: dict(w=2028, h=1520, fps=40, fx=None, kind="2x2 binned, full FOV"),
-            2: dict(w=2028, h=1080, fps=50, fx=None, kind="binned + vertical crop"),
-            3: dict(w=1332, h=990, fps=120, fx=None, kind="crop"),
+            0: dict(w=4056, h=3040, fps=10, fx=None, px_um=1.55, kind="full array"),
+            1: dict(w=2028, h=1520, fps=40, fx=None, px_um=3.10, kind="2x2 binned, full FOV"),
+            2: dict(w=2028, h=1080, fps=50, fx=None, px_um=3.10, kind="binned + vertical crop"),
+            3: dict(w=1332, h=990, fps=120, fx=None, px_um=1.55, kind="crop"),
         },
         "default_mode": 1,
     },
@@ -346,6 +376,55 @@ def argus_failure_advice(platform):
         "    3. another consumer:      ps aux | grep -E 'gst-launch|argus'\n"
         "    4. wrong --sensor-id, or that mode is unsupported:\n"
         "                              ./tools/check_camera.sh --capture")
+
+
+def closest_working_distance(targets, width, height, cols, rows, square_m, fx):
+    """Metres from lens to board at the most demanding target.
+
+    The fill thresholds do not just ask for a position, they fix a DISTANCE: a
+    given fraction of a given box, with a board of a given physical size, can only
+    be satisfied from one range. Board size is therefore not a free choice, and it
+    is the one parameter people pick by what their printer will do.
+    """
+    aspect = (cols - 1) / max(rows - 1, 1)
+    span_m = (cols - 1) * square_m
+    best = None
+    for x1, y1, x2, y2, fill, _n in targets:
+        bw = (x2 - x1) * width // 100
+        bh = (y2 - y1) * height // 100
+        inner_px = math.sqrt((fill / 100.0) * bw * bh * aspect)
+        if inner_px <= 0:
+            continue
+        z = fx * span_m / inner_px
+        best = z if best is None else min(best, z)
+    return best
+
+
+# Below this a fixed-focus module is working inside its near limit. The IMX219 in
+# its usual fixed-focus form is set around a metre and is visibly soft at a third
+# of one; the corners then localise poorly in a way that looks exactly like a
+# systematically bad calibration, because that is what it is.
+NEAR_FOCUS_LIMIT_M = 0.50
+
+
+def warn_working_distance(targets, width, height, cols, rows, square_mm, fx):
+    z = closest_working_distance(targets, width, height, cols, rows,
+                                 square_mm / 1000.0, fx)
+    if z is None or z >= NEAR_FOCUS_LIMIT_M:
+        return
+    need = square_mm * NEAR_FOCUS_LIMIT_M / z
+    print(f"\n  NOTE: {square_mm:.0f} mm squares force the board to {z:.2f} m at the")
+    print(f"  tightest target, inside the ~{NEAR_FOCUS_LIMIT_M:.2f} m near limit of a "
+          f"typical fixed-focus module.")
+    print("  Uniform softness on its own is fairly harmless — a defocused chessboard")
+    print("  corner stays put. The problem at close range is depth of field across a")
+    print("  TILTED board, where one end defocuses more than the other, and that")
+    print("  asymmetry does move corners. Close range also leaves little room to")
+    print("  tilt at all.")
+    print(f"  Print the board at about {need:.0f} mm squares (or larger) to work at "
+          f"{NEAR_FOCUS_LIMIT_M:.2f} m+.")
+    print("  ModalAI's own default is 65.5 mm for this reason. If your camera focuses")
+    print(f"  closer than {z:.2f} m, ignore this.\n")
 
 
 def print_mode_table():
@@ -1166,6 +1245,17 @@ def write_opencv_yml(path, K, dist, model, w, h, rms):
 # Capture loops
 # ---------------------------------------------------------------------------
 
+def out_path(args):
+    return args.out or f"calib_{re.sub(r'[^A-Za-z0-9_.-]', '_', args.camera_id)}.yaml"
+
+
+def load_points(path):
+    d = np.load(path)
+    obj = [o for o in d["obj"]]
+    img = [i for i in d["img"]]
+    return obj, img, tuple(int(v) for v in d["img_size"])
+
+
 def open_capture(gst=None, video=None):
     if video:
         cap = cv2.VideoCapture(video)
@@ -1241,6 +1331,9 @@ def guided_capture(args, cap, preview, objp, pattern):
             print(f"  frame size {w}x{h}, {queue.count} targets, "
                   f"{'fisheye' if args.fisheye else 'pinhole'} set, "
                   f"board {board_aspect:.2f}:1\n")
+            if args.fx_guess:
+                warn_working_distance(targets, w, h, cols, rows,
+                                      args.square_mm, args.fx_guess)
 
         if control.stop or queue.done:
             break
@@ -1291,7 +1384,8 @@ def guided_capture(args, cap, preview, objp, pattern):
             queue.accept()
             if queue.done:
                 if preview:
-                    preview.publish(make_overlay(color, 1.0,
+                    done_img = cv2.flip(color, 1) if args.mirror else color
+                    preview.publish(make_overlay(done_img, 1.0,
                                                  "Sampling complete", ""))
                 break
 
@@ -1302,6 +1396,16 @@ def guided_capture(args, cap, preview, objp, pattern):
         footer = (f"Board {cols}x{rows}  {args.square_mm:.1f}mm   "
                   f"views {len(obj_points)}")
 
+        # PREVIEW ONLY, and only after detection, acceptance and every overlay
+        # has been drawn. Two reasons it has to be here:
+        #
+        #   flipping the image before detection would hand the solver a mirrored
+        #   board — the chirality reverses, so the fitted pose is a reflection and
+        #   the intrinsics come out quietly wrong;
+        #
+        #   flipping the composite rather than just the video keeps the target box
+        #   registered with the scene. Both move together, so the box still marks
+        #   where the board physically has to go.
         if args.mirror:
             color = cv2.flip(color, 1)
         if preview:
@@ -1343,6 +1447,8 @@ def main():
     src.add_argument("--gst", help="GStreamer pipeline ending in an appsink producing BGR")
     src.add_argument("--images", nargs="+", help="image files instead of live capture")
     src.add_argument("--video", help="video file, run through the guided loop")
+    src.add_argument("--from-points", help="re-solve from a saved *_points.npz "
+                                           "instead of capturing again")
 
     ap.add_argument("--sensor", choices=sorted(SENSORS),
                     help="build the pipeline and seed the intrinsics guess")
@@ -1446,10 +1552,11 @@ def main():
             print("no intrinsics guess: this sensor takes interchangeable lenses, "
                   "so there is no focal length to derive")
         print(f"pipeline:\n  {args.gst}\n")
-    elif not (args.gst or args.images or args.video):
+    elif not (args.gst or args.images or args.video or args.from_points):
         sys.exit("pass --sensor <name>, --gst <pipeline>, --video <file>, "
-                 "or --images <files>")
+                 "--images <files>, or --from-points <file>")
 
+    args.fx_guess = fx_guess        # guided_capture warns on working distance
     if args.mode is None:
         args.mode = ""
     pattern = (args.cols, args.rows)
@@ -1467,7 +1574,11 @@ def main():
     print(f"board {args.cols}x{args.rows} inner corners, {args.square_mm} mm squares")
 
     # --- collect ------------------------------------------------------------
-    if args.images:
+    if args.from_points:
+        obj_points, img_points, img_size = load_points(args.from_points)
+        print(f"  replaying {len(obj_points)} saved detections from "
+              f"{args.from_points} (no camera used)")
+    elif args.images:
         obj_points, img_points, img_size = image_capture(args, objp, pattern)
     else:
         preview = None
@@ -1499,7 +1610,19 @@ def main():
             print("\ninterrupted")
             obj_points, img_points, img_size = [], [], None
         finally:
-            cap.release()
+            # nvarguscamerasrc can block forever tearing the Argus session down,
+            # after it has already printed "GST_ARGUS: Done Success". That is the
+            # camera stack's problem, but without this it becomes ours: the views
+            # are collected and sitting in memory, and a wedged release() strands
+            # them behind an unkillable-looking prompt. Release on a daemon thread
+            # and move on — the process is about to exit anyway, so a leaked
+            # capture costs nothing, and the calibration is what matters.
+            releaser = threading.Thread(target=cap.release, daemon=True)
+            releaser.start()
+            releaser.join(RELEASE_TIMEOUT)
+            if releaser.is_alive():
+                print(f"  (camera teardown did not finish in {RELEASE_TIMEOUT:.0f} s "
+                      f"— continuing; this is an nvarguscamerasrc quirk)")
             if preview:
                 time.sleep(0.5)   # let the last overlay reach the browser
                 preview.close()
@@ -1507,6 +1630,23 @@ def main():
     n = len(obj_points)
     if n < 6 or img_size is None:
         sys.exit(f"\nonly {n} usable views — need at least 6. Nothing written.")
+
+    # Persist the detections before solving. Collecting them is the part that
+    # costs minutes of standing in front of a camera; solving takes a second and
+    # may well want repeating with different flags. --from-points replays these
+    # without touching the camera, which also means a failed run is worth keeping.
+    if not args.from_points:
+        pts_path = os.path.splitext(out_path(args))[0] + "_points.npz"
+        try:
+            np.savez(pts_path,
+                     obj=np.array(obj_points, dtype=np.float32),
+                     img=np.array(img_points, dtype=np.float32),
+                     img_size=np.array(img_size),
+                     cols=args.cols, rows=args.rows, square_mm=args.square_mm)
+            print(f"  detections saved to {pts_path}")
+            print(f"  (re-solve without the camera: --from-points {pts_path})")
+        except OSError as e:
+            print(f"  could not save detections: {e}")
 
     # --- solve --------------------------------------------------------------
     print(f"\ncollected {n} views, calibrating...")
@@ -1531,17 +1671,49 @@ def main():
     print(f"  per-view: best {min(errs):.3f}  median {np.median(errs):.3f}  "
           f"worst {max(errs):.3f} (view {worst + 1})")
 
+    med = float(np.median(errs))
     if rms > cutoff:
         print("\n  FAILED. Do not ship this.")
-        print("  Above this threshold the cause is almost always motion blur, a")
-        print("  board that is not rigid and flat, or a wrong --square-mm.")
-        if max(errs) > 3 * np.median(errs):
-            print(f"  View {worst + 1} is a clear outlier at {max(errs):.2f} px — one bad")
-            print("  detection rather than a systematic problem. Re-run; if it")
-            print("  recurs, that target is where the blur is.")
+        # An outlier and a systematic problem are not alternatives, and treating
+        # them as such misreads the common case: a high median with one worse view
+        # still means EVERY view is bad, and dropping the worst fixes nothing.
+        # The median is what separates them, so test it first and independently.
+        if med > cutoff:
+            span_mm = (args.cols - 1) * args.square_mm
+            print(f"  The MEDIAN view is {med:.2f} px, already past the {cutoff} px")
+            print("  threshold, so this is systematic — not one bad capture.")
+            print()
+            print("  By far the most likely cause is that THE BOARD IS NOT FLAT.")
+            print("  The solver is told the corners are coplanar; every millimetre")
+            print("  they are not goes straight into the fit and cannot be averaged")
+            print(f"  out by more views. On your {span_mm:.0f} mm board, measured:")
+            print("      bow  1 mm (0.5% of width) -> ~0.19 px")
+            print("      bow  2 mm (1.0%)          -> ~0.39 px")
+            print("      bow  5 mm (2.5%)          -> ~0.96 px  and fx off by ~4%")
+            print(f"  Keep it flat to about 0.5% of its width — {span_mm * 0.005:.1f} mm here.")
+            print("  Paper taped to a wall or held in the hand does not meet that;")
+            print("  glass, MDF or aluminium composite does. This is the single")
+            print("  highest-value thing to fix.")
+            print()
+            print("  Less likely, in order:")
+            print("    - the print is scaled non-uniformly (check x and y separately")
+            print("      against a steel rule, not just one square).")
+            print("    - the board moved during exposure. The IMX219 is rolling")
+            print("      shutter, so motion shears it rather than smearing it, and")
+            print("      shear does bias corners. Hold still between captures.")
+            print("  Plain defocus and straight-line motion blur are NOT likely causes:")
+            print("  both are symmetric and leave a chessboard saddle point where it")
+            print("  was. A sharp-looking preview does not rule out a bent board.")
+            if max(errs) > 3 * med:
+                print(f"\n  View {worst + 1} is additionally an outlier at {max(errs):.2f} px.")
+        elif max(errs) > 3 * med:
+            print(f"  The median view is {med:.2f} px, which is fine — view {worst + 1} alone")
+            print(f"  is bad at {max(errs):.2f} px. One bad detection, not a systematic")
+            print("  problem. Re-run; if it recurs, that target is where the blur is.")
         else:
-            print("  The error is spread evenly across views, which points at the")
-            print("  board or --square-mm rather than at any one capture.")
+            print("  The error is spread across views without a clear outlier, which")
+            print("  points at the board or the capture conditions rather than at any")
+            print("  one view.")
     elif rms > cutoff / 2:
         print("  acceptable, but tighter is better for a landing.")
     else:
@@ -1555,13 +1727,34 @@ def main():
     # output resolution, and that is measurable rather than a matter of opinion.
     if args.sensor and fx_guess:
         expected = math.degrees(2 * math.atan(w / (2 * fx_guess)))
-        drift = abs(hfov - expected)
+        drift = hfov - expected
         print(f"\n  geometry predicted {expected:.1f} deg, measured {hfov:.1f} deg "
-              f"({drift:.1f} deg apart).")
-        if drift > 5:
-            print("  That is a big gap. The likely cause is that the sensor mode")
-            print("  actually running is not the one requested — check the mode")
-            print("  Argus reports in tools/check_camera.sh.")
+              f"({abs(drift):.1f} deg apart).")
+        if abs(drift) > 5:
+            if rms > cutoff:
+                print("  Treat that gap as unexplained for now: the fit did not pass,")
+                print("  and a bad fit moves fx directly. Fix the error first — the")
+                print("  question usually answers itself.")
+            # The SIGN carries the diagnosis, and collapsing it to a magnitude
+            # throws away the only thing that distinguishes the two causes.
+            elif drift > 0:
+                mode_info = SENSORS[args.sensor]["modes"].get(args.mode, {})
+                px_um = mode_info.get("px_um")
+                print("  Measured WIDER than predicted. A crop can only ever narrow the")
+                print("  field of view, and this preset already describes the widest")
+                print("  mode, so the sensor mode cannot explain it. The lens can:")
+                print("  the preset assumes the stock 3.04 mm Pi Camera v2 lens, and")
+                print("  plenty of IMX219 boards ship a wider one.")
+                if px_um:
+                    print(f"  Measured fx implies a focal length of about "
+                          f"{fx * px_um / 1000.0:.2f} mm.")
+                print("  Nothing is wrong with the calibration — the preset's guess was")
+                print("  for a different lens. Use the measured numbers.")
+            else:
+                print("  Measured NARROWER than predicted, which is what a cropped")
+                print("  sensor mode looks like. Check the mode Argus actually ran")
+                print("  against the one requested:  tools/check_camera.sh --capture")
+                print("  A longer lens than the preset assumes would look the same.")
     if hfov < 45:
         print(f"  {hfov:.0f} deg is narrow for precision landing: at 1 m altitude this")
         print(f"  sees about {2 * 1.0 * math.tan(math.radians(hfov / 2)):.2f} m across, "
@@ -1577,7 +1770,7 @@ def main():
         print("  Mild is normal; large usually means an off-centre sensor crop.")
 
     # --- write --------------------------------------------------------------
-    out = args.out or f"calib_{re.sub(r'[^A-Za-z0-9_.-]', '_', args.camera_id)}.yaml"
+    out = out_path(args)
     write_result(out, K, dist, model, w, h, rms, args, n)
     if args.opencv_yml:
         write_opencv_yml(args.opencv_yml, K, dist, model, w, h, rms)
