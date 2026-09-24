@@ -81,7 +81,7 @@ streams:
       # noticeable barrel distortion near the edges.
       #
       # Measure before flight:
-      #   tools/calibrate_camera.py --square-mm <measured> --gst "<this pipeline, BGR>"
+      #   tools/calibrate_camera.py --sensor imx219 --mode 3 --square-mm <measured>
       fx: 1357.0
       fy: 1357.0
       cx: 820.0

@@ -77,13 +77,21 @@ case "${PLATFORM}" in
     ;;
 esac
 
-# ---- optional: the python test harness -----------------------------------
-apt-get install -y --no-install-recommends python3-protobuf python3-numpy || true
+# ---- optional: the python test harness and tools/ -------------------------
+#
+# python3-opencv is what tools/calibrate_camera.py runs on. It is a separate
+# package from libopencv-dev above: that one is the C++ library the service links
+# against and it does NOT provide the python bindings. Without this the service
+# builds and runs fine and you simply cannot calibrate, which is a confusing way
+# to discover the dependency on a board with no camera bench time left.
+apt-get install -y --no-install-recommends \
+    python3-protobuf python3-numpy python3-opencv || true
 
 echo
 echo "[deps] done."
 echo
 echo "  OpenCV    : $(pkg-config --modversion opencv4 2>/dev/null || echo '?')"
+echo "  cv2 (py)  : $(python3 -c 'import cv2; print(cv2.__version__)' 2>/dev/null || echo 'not installed - tools/calibrate_camera.py will not run')"
 echo "  GStreamer : $(pkg-config --modversion gstreamer-1.0 2>/dev/null || echo '?')"
 echo "  protoc    : $(protoc --version 2>/dev/null || echo '?')"
 echo

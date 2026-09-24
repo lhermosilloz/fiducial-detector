@@ -409,7 +409,8 @@ tools/
   fake_publisher.py         synthetic frames -> drives Nexus with no hardware
   recv_fiducial.py          decode + verify wire invariants
   make_test_video.py        synthetic clip with ground truth; also prints markers
-  calibrate_camera.py       measure intrinsics; emits the config's camera: block
+  calibrate_camera.py       guided intrinsics calibration with an MJPEG preview;
+                            emits the config's camera: block
   check_camera.sh           does the camera enumerate, and by which path?
 ```
 

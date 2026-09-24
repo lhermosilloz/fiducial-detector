@@ -130,12 +130,29 @@ and the IMX219 lens has visible barrel distortion toward the edges. A 10% error 
 range is what the consumer ranks landing candidates on.
 
 ```bash
-./tools/calibrate_camera.py --square-mm <measured> --gst \
- "nvarguscamerasrc sensor-id=0 sensor-mode=3 !
-  video/x-raw(memory:NVMM),width=1640,height=1232,framerate=30/1 !
-  nvvidconv ! video/x-raw,format=BGRx ! videoconvert !
-  video/x-raw,format=BGR ! appsink drop=true max-buffers=2"
+./tools/calibrate_camera.py --sensor imx219 --mode 3 --square-mm <measured>
 ```
+
+`--sensor imx219 --mode 3` builds exactly the pipeline above and seeds the optimiser with
+the 1357 px geometric estimate. `--list-modes` prints the mode table; `--gst "<pipeline>"`
+takes over for any camera without a preset.
+
+The tool does not simply grab twenty frames. It works through a queue of target boxes and
+will not accept a view until the board sits wholly inside the current box and covers
+enough of it, which is what forces the coverage that constrains distortion and the
+principal point. Watch it and aim the board using the MJPEG preview it prints:
+
+```
+preview:  http://192.168.55.1:8080
+```
+
+Open that in a browser on the development machine. The target box fades red to green as
+the board approaches the required fill. On stdin, ENTER skips a target you cannot reach
+(an obstructed corner) and `stop` ends sampling early.
+
+It fails loudly rather than quietly: above 0.75 px RMS reprojection error it refuses to
+call the result a calibration, and it reports per-view error so a single bad capture is
+distinguishable from a systematically wrong `--square-mm` or a board that is not flat.
 
 Recalibrate after any sensor-mode change: a different mode is a different crop or a
 different binning factor, so the focal length and principal point both move.

@@ -45,7 +45,9 @@ streams:
       # Placeholders; see config/jetson_down.yaml. Calibrate per physical
       # camera and lens: two IMX477s with nominally identical 6 mm lenses do
       # not share intrinsics closely enough for a 10 cm landing.
-      # Use tools/calibrate_camera.py.
+      # Use tools/calibrate_camera.py --sensor imx477 --mode 1 (the HQ camera takes
+      # interchangeable lenses, so there is no focal length to seed it with; the
+      # solver finds it from the board).
       fx: 1283.0
       fy: 1283.0
       cx: 640.0
