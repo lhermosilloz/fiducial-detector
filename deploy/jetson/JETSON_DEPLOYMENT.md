@@ -257,6 +257,29 @@ In order of likelihood:
 3. **Another Argus consumer holds the sensor.** Only one is permitted:
    `ps aux | grep gst-launch`
 
+**`Failed to create CaptureSession`.** Distinct from the error above, and the distinction
+is the whole diagnosis: `CameraProvider` failing means the process could not reach
+`nvargus-daemon`, whereas `CaptureSession` failing means it reached the daemon fine and
+then could not acquire the *sensor*. So the daemon, the socket, the device tree and the
+driver are all working, and the sensor is busy or stale.
+
+Argus permits exactly one client per sensor. The usual cause is simply that the service is
+running:
+
+```bash
+sudo systemctl stop fiducial-detector-service
+./tools/calibrate_camera.py --sensor imx219 --mode 3 --square-mm <measured>
+sudo systemctl start fiducial-detector-service
+```
+
+If nothing obvious holds it, a previous client that died can leave the session behind;
+`sudo systemctl restart nvargus-daemon` clears that. `ps aux | grep -E 'gst-launch|argus'`
+finds the rest.
+
+This is easy to mistake for a pipeline problem, because GStreamer reports the pipeline as
+opened and only then produces no frames. `tools/calibrate_camera.py` checks for both
+causes before it starts capturing and names them if it still gets no frame.
+
 **`nvarguscamerasrc` works in `gst-launch` but not in the service.** If the error is not
 the one above, it is usually group membership: the unit runs as the unprivileged
 `fiducial` user.

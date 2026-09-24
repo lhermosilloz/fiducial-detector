@@ -93,6 +93,7 @@ import glob
 import math
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -272,6 +273,79 @@ def build_pipeline(platform, mode_info, sensor_mode, sensor_id=0):
         f"videoconvert ! video/x-raw,format=BGR ! "
         f"appsink name={OPENCV_SINK_NAME} drop=true max-buffers=2 sync=false"
     )
+
+
+def _unit_active(name):
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", name],
+                              timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False        # no systemd, or systemctl unavailable: not a finding
+
+
+def _other_argus_consumers():
+    """Processes likely to be holding a camera, excluding this one."""
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    me = str(os.getpid())
+    hits = []
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if pid == me or "calibrate_camera" in args:
+            continue
+        if any(k in args for k in ("gst-launch", "nvgstcapture", "argus_camera",
+                                   "fiducial-detector-service", "nvargus_nvraw")):
+            hits.append(f"{pid} {args[:70]}")
+    return hits
+
+
+def camera_preflight(platform):
+    """Report what will stop Argus BEFORE sitting in a read loop waiting on it.
+
+    Argus permits exactly one client per sensor, and says so only as
+    `Failed to create CaptureSession` — printed well after the pipeline has been
+    built and reported as successfully opened. OpenCV then simply returns no
+    frames, and nothing on screen connects the two.
+
+    The service is the overwhelmingly likely holder: it is installed on this same
+    board, it is configured for sensor-id=0, and a calibration run gives it no
+    reason to release anything.
+    """
+    notes = []
+    if _unit_active("fiducial-detector-service"):
+        notes.append(
+            "fiducial-detector-service is RUNNING and holds the camera.\n"
+            "    Argus allows one client per sensor, so calibration cannot open it:\n"
+            "        sudo systemctl stop fiducial-detector-service\n"
+            "    Start it again when you are done.")
+    if platform == "jetson" and not _unit_active("nvargus-daemon"):
+        notes.append(
+            "nvargus-daemon is NOT active; nvarguscamerasrc cannot work without it:\n"
+            "        sudo systemctl restart nvargus-daemon")
+    others = _other_argus_consumers()
+    if others:
+        notes.append("another process may be holding the camera:\n" +
+                     "\n".join(f"        {h}" for h in others))
+    return notes
+
+
+def argus_failure_advice(platform):
+    """What to say when the pipeline opened but no frame ever arrived."""
+    if platform != "jetson":
+        return "  - run tools/check_camera.sh --capture to settle the ingest path"
+    return (
+        "  If Argus printed 'Failed to create CaptureSession', the daemon WAS\n"
+        "  reachable but the sensor could not be acquired. That is a busy or stale\n"
+        "  sensor — not a missing driver, and not a bad pipeline. In order of\n"
+        "  likelihood:\n"
+        "    1. the service holds it:  sudo systemctl stop fiducial-detector-service\n"
+        "    2. a stale Argus session: sudo systemctl restart nvargus-daemon\n"
+        "    3. another consumer:      ps aux | grep -E 'gst-launch|argus'\n"
+        "    4. wrong --sensor-id, or that mode is unsupported:\n"
+        "                              ./tools/check_camera.sh --capture")
 
 
 def print_mode_table():
@@ -1128,6 +1202,7 @@ def guided_capture(args, cap, preview, objp, pattern):
     last_accept = 0.0
     t0 = time.time()
     frames = 0
+    waiting_said = False
 
     while True:
         ok, frame = cap.read()
@@ -1135,9 +1210,19 @@ def guided_capture(args, cap, preview, objp, pattern):
             if args.video:
                 print("\n  end of file reached before sampling completed")
                 break
+            # cap.read() failing on a live source does not mean the pipeline is
+            # broken — it is also what a camera that has not warmed up looks like.
+            # The distinction is how long it goes on for.
+            if not waiting_said and frames == 0:
+                waiting_said = True
+                print(f"  waiting for the first frame "
+                      f"(giving up after {args.open_timeout:.0f} s)...")
             time.sleep(0.05)
-            if time.time() - t0 > 60 and not obj_points:
-                sys.exit("no frames in 60 s — check the pipeline")
+            if frames == 0 and time.time() - t0 > args.open_timeout:
+                print(f"\nthe pipeline opened but produced no frame in "
+                      f"{args.open_timeout:.0f} s.\n")
+                print(argus_failure_advice(args.platform or detect_platform()))
+                sys.exit(1)
             continue
 
         frames += 1
@@ -1293,6 +1378,9 @@ def main():
                          "inflate the view count without constraining anything. "
                          "0 for ModalAI's behaviour")
 
+    ap.add_argument("--open-timeout", type=float, default=15.0,
+                    help="seconds to wait for the first frame before giving up "
+                         "with a diagnosis")
     ap.add_argument("--adapt-after", type=float, default=20.0,
                     help="seconds of visible effort on one target before its fill "
                          "threshold is lowered to what is actually achievable. "
@@ -1398,6 +1486,10 @@ def main():
             print("\nOpen that in a browser. Put the board inside the red box and")
             print("move it closer until the box turns green.")
             print("ENTER skips a target, 'stop' finishes sampling early.\n")
+
+        if not args.video:
+            for note in camera_preflight(args.platform or detect_platform()):
+                print(f"  WARNING: {note}\n")
 
         cap = open_capture(args.gst, args.video)
         try:
