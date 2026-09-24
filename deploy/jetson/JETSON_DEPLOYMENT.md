@@ -137,6 +137,12 @@ range is what the consumer ranks landing candidates on.
 the 1357 px geometric estimate. `--list-modes` prints the mode table; `--gst "<pipeline>"`
 takes over for any camera without a preset.
 
+If you hand it a pipeline copied from `config/*.yaml`, note that those name the appsink
+`sink` because the service looks it up by that name, whereas OpenCV only recognises a sink
+whose name contains `appsink` or `opencvsink`. Mismatched, it reports `cannot find appsink
+in manual pipeline`, which reads as though the element were missing. The tool renames it
+and says so, so this is a thing to recognise rather than to fix.
+
 The tool does not simply grab twenty frames. It works through a queue of target boxes and
 will not accept a view until the board sits wholly inside the current box and covers
 enough of it, which is what forces the coverage that constrains distortion and the

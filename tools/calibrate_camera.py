@@ -54,6 +54,13 @@ Usage
       video/x-raw,width=1280,height=720,format=NV12 ! videoconvert !
       video/x-raw,format=BGR ! appsink drop=true max-buffers=2"
 
+  Copying a pipeline out of config/*.yaml works, with one wrinkle handled for
+  you: those name the sink `sink`, because the service looks it up by that name,
+  while OpenCV only recognises a sink whose name contains "appsink" or
+  "opencvsink" and otherwise reports "cannot find appsink in manual pipeline" —
+  which sounds like the element is missing rather than misnamed. The sink is
+  renamed automatically and the change is printed.
+
   # From images you already shot (no guided capture, no preview)
   ./tools/calibrate_camera.py --images ./calib/*.jpg
 
@@ -182,6 +189,53 @@ def detect_platform():
     return "generic"
 
 
+# OpenCV's GStreamer backend does not take the sink you hand it. It parses the
+# pipeline and then scans for an element whose NAME contains "appsink" or
+# "opencvsink" (modules/videoio/src/cap_gstreamer.cpp). An appsink named anything
+# else is invisible to it, and the failure is the thoroughly unhelpful
+#
+#     GStreamer warning: cannot find appsink in manual pipeline
+#
+# which reads like the element is missing rather than misnamed.
+#
+# This is a trap rather than a detail, because the service's own configs name it
+# `sink` — the C++ side looks it up with gst_bin_get_by_name(pipeline, "sink") —
+# and the documented way to calibrate is to reuse the pipeline the service runs.
+# The same element, with two incompatible lookup rules. An unnamed appsink is
+# fine either way: GStreamer auto-names it "appsink0".
+OPENCV_SINK_NAME = "opencvsink"
+
+
+def normalise_appsink(pipeline):
+    """Rename the appsink if OpenCV would not find it.
+
+    Returns (pipeline, note) where note is None if nothing needed changing.
+    Operates only on the appsink element, located by splitting on '!', rather
+    than by pattern-matching the whole pipeline string — a `name=` belonging to
+    some other element must not be touched.
+    """
+    parts = pipeline.split("!")
+    for i, part in enumerate(parts):
+        if part.strip().split()[:1] != ["appsink"]:
+            continue
+        m = re.search(r"\bname\s*=\s*(\S+)", part)
+        if m is None:
+            return pipeline, None          # unnamed: GStreamer calls it appsink0
+        current = m.group(1)
+        if "appsink" in current or "opencvsink" in current:
+            return pipeline, None
+        parts[i] = part[:m.start(1)] + OPENCV_SINK_NAME + part[m.end(1):]
+        return "!".join(parts), (
+            f"  note: renamed the appsink from '{current}' to "
+            f"'{OPENCV_SINK_NAME}'.\n"
+            f"        OpenCV locates the sink by name and ignores one called "
+            f"'{current}'; the\n"
+            f"        service itself requires 'sink', so a pipeline copied from "
+            f"config/*.yaml\n"
+            f"        needs exactly this one change.")
+    return pipeline, None
+
+
 def build_pipeline(platform, mode_info, sensor_mode, sensor_id=0):
     """A pipeline in the shape of the service's, but ending in BGR.
 
@@ -192,6 +246,9 @@ def build_pipeline(platform, mode_info, sensor_mode, sensor_id=0):
 
     What must NOT change from the service's pipeline is the sensor mode and the
     output resolution. Intrinsics belong to a mode, not to a camera.
+
+    The appsink's NAME differs from the service's, and it has to — see
+    OPENCV_SINK_NAME.
     """
     w, h, fps = mode_info["w"], mode_info["h"], mode_info["fps"]
     if platform == "jetson":
@@ -200,20 +257,20 @@ def build_pipeline(platform, mode_info, sensor_mode, sensor_id=0):
             f"video/x-raw(memory:NVMM),width={w},height={h},framerate={fps}/1 ! "
             f"nvvidconv ! video/x-raw,format=BGRx ! "
             f"videoconvert ! video/x-raw,format=BGR ! "
-            f"appsink name=sink drop=true max-buffers=2 sync=false"
+            f"appsink name={OPENCV_SINK_NAME} drop=true max-buffers=2 sync=false"
         )
     if platform == "pi":
         return (
             f"libcamerasrc ! "
             f"video/x-raw,width={w},height={h},framerate={fps}/1,format=NV12 ! "
             f"videoconvert ! video/x-raw,format=BGR ! "
-            f"appsink name=sink drop=true max-buffers=2 sync=false"
+            f"appsink name={OPENCV_SINK_NAME} drop=true max-buffers=2 sync=false"
         )
     return (
         f"v4l2src device=/dev/video{sensor_id} ! "
         f"video/x-raw,width={w},height={h} ! "
         f"videoconvert ! video/x-raw,format=BGR ! "
-        f"appsink name=sink drop=true max-buffers=2 sync=false"
+        f"appsink name={OPENCV_SINK_NAME} drop=true max-buffers=2 sync=false"
     )
 
 
@@ -1041,10 +1098,16 @@ def open_capture(gst=None, video=None):
         if not cap.isOpened():
             sys.exit(f"cannot open video file: {video}")
         return cap
+    gst, note = normalise_appsink(gst)
+    if note:
+        print(note)
     cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
     if not cap.isOpened():
         sys.exit("cannot open the GStreamer pipeline.\n"
                  "  - check it ends in an appsink producing BGR\n"
+                 "  - 'cannot find appsink in manual pipeline' means the appsink is\n"
+                 "    misnamed, not missing: OpenCV only recognises a sink whose name\n"
+                 "    contains 'appsink' or 'opencvsink'. Drop `name=sink`.\n"
                  "  - check OpenCV was built with GStreamer: "
                  "python3 -c \"import cv2; print(cv2.getBuildInformation())\" "
                  "| grep -i gstreamer\n"
